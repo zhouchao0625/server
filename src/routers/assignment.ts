@@ -159,7 +159,10 @@ export const assignmentRouter = createTRPCRouter({
       }
 
       if (!markSchemeId) {
-        throw new Error("markSchemeId is required");
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message: "markSchemeId is required",
+        });
       }
 
       const rubric = await prisma.markScheme.findUnique({
@@ -337,7 +340,6 @@ export const assignmentRouter = createTRPCRouter({
       });
 
       // Clear cache for this assignment
-      await redis.del(`assignment:${assignmentId}`);
       await redis.del(`classes:${assignment.classId}`);
 
       return newComment;
@@ -431,7 +433,10 @@ export const assignmentRouter = createTRPCRouter({
       });
 
       if (!comment) {
-        throw new Error("Comment not found");
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message: "Comment not found",
+        });
       }
 
       // Delete comment

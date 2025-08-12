@@ -522,11 +522,17 @@ export const classRouter = createTRPCRouter({
       });
 
       if (!session || !session.classId) {
-        throw new Error("Class not found");
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message: "Class not found",
+        });
       }
 
       if (session.expiresAt && session.expiresAt < new Date()) {
-        throw new Error("Session expired");
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message: "Session expired",
+        });
       }
 
       const updatedClass = await prisma.class.update({
