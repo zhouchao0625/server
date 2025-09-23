@@ -76,14 +76,20 @@ export const conversationRouter = createTRPCRouter({
         });
 
         // Count unread mentions
+        // Use the later of lastViewedAt or lastViewedMentionAt
+        // This means if user viewed conversation after mention, mention is considered read
+        const mentionCutoffTime = lastViewedMentionAt && lastViewedAt 
+          ? (lastViewedMentionAt > lastViewedAt ? lastViewedMentionAt : lastViewedAt)
+          : (lastViewedMentionAt || lastViewedAt);
+        
         const unreadMentionCount = await prisma.mention.count({
           where: {
             userId,
             message: {
               conversationId: conversation.id,
               senderId: { not: userId },
-              ...(lastViewedMentionAt && {
-                createdAt: { gt: lastViewedMentionAt }
+              ...(mentionCutoffTime && {
+                createdAt: { gt: mentionCutoffTime }
               }),
             },
           },
