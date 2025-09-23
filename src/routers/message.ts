@@ -212,7 +212,232 @@ export const messageRouter = createTRPCRouter({
         mentionedUserIds,
       };
     }),
+  update: protectedProcedure
+    .input(
+      z.object({
+        messageId: z.string(),
+        content: z.string().min(1).max(4000),
+        mentionedUserIds: z.array(z.string()).optional(),
+      })
+    )
+    .mutation(async ({ input, ctx }) => {
+      const userId = ctx.user!.id;
+      const { messageId, content, mentionedUserIds = [] } = input;
 
+      // Get the existing message and verify user is the sender
+      const existingMessage = await prisma.message.findUnique({
+        where: { id: messageId },
+        include: {
+          sender: {
+            select: {
+              id: true,
+              username: true,
+              profile: {
+                select: {
+                  displayName: true,
+                  profilePicture: true,
+                },
+              },
+            },
+          },
+        },
+      });
+
+      if (!existingMessage) {
+        throw new TRPCError({
+          code: 'NOT_FOUND',
+          message: 'Message not found',
+        });
+      }
+
+      if (existingMessage.senderId !== userId) {
+        throw new TRPCError({
+          code: 'FORBIDDEN',
+          message: 'Not the sender of this message',
+        });
+      }
+
+      // Verify user is still a member of the conversation
+      const membership = await prisma.conversationMember.findFirst({
+        where: {
+          conversationId: existingMessage.conversationId,
+          userId,
+        },
+      });
+
+      if (!membership) {
+        throw new TRPCError({
+          code: 'FORBIDDEN',
+          message: 'Not a member of this conversation',
+        });
+      }
+
+      // Verify mentioned users are members of the conversation
+      if (mentionedUserIds.length > 0) {
+        const mentionedMemberships = await prisma.conversationMember.findMany({
+          where: {
+            conversationId: existingMessage.conversationId,
+            userId: { in: mentionedUserIds },
+          },
+        });
+
+        if (mentionedMemberships.length !== mentionedUserIds.length) {
+          throw new TRPCError({
+            code: 'BAD_REQUEST',
+            message: 'Some mentioned users are not members of this conversation',
+          });
+        }
+      }
+
+      // Update message and mentions in transaction
+      const updatedMessage = await prisma.$transaction(async (tx) => {
+        // Update the message content
+        const message = await tx.message.update({
+          where: { id: messageId },
+          data: { content },
+          include: {
+            sender: {
+              select: {
+                id: true,
+                username: true,
+                profile: {
+                  select: {
+                    displayName: true,
+                    profilePicture: true,
+                  },
+                },
+              },
+            },
+          },
+        });
+
+        // Delete existing mentions
+        await tx.mention.deleteMany({
+          where: { messageId },
+        });
+
+        // Create new mentions if any
+        if (mentionedUserIds.length > 0) {
+          await tx.mention.createMany({
+            data: mentionedUserIds.map((mentionedUserId) => ({
+              messageId,
+              userId: mentionedUserId,
+            })),
+          });
+        }
+
+        return message;
+      });
+
+      // Broadcast message update to Pusher
+      try {
+        await pusher.trigger(`conversation-${existingMessage.conversationId}`, 'message-updated', {
+          id: updatedMessage.id,
+          content: updatedMessage.content,
+          senderId: updatedMessage.senderId,
+          conversationId: updatedMessage.conversationId,
+          createdAt: updatedMessage.createdAt,
+          sender: updatedMessage.sender,
+          mentionedUserIds,
+        });
+      } catch (error) {
+        console.error('Failed to broadcast message update:', error);
+        // Don't fail the request if Pusher fails
+      }
+
+      return {
+        id: updatedMessage.id,
+        content: updatedMessage.content,
+        senderId: updatedMessage.senderId,
+        conversationId: updatedMessage.conversationId,
+        createdAt: updatedMessage.createdAt,
+        sender: updatedMessage.sender,
+        mentionedUserIds,
+      };
+    }),
+
+  delete: protectedProcedure
+    .input(
+      z.object({
+        messageId: z.string(),
+      })
+    )
+    .mutation(async ({ input, ctx }) => {
+      const userId = ctx.user!.id;
+      const { messageId } = input;
+
+      // Get the message and verify user is the sender
+      const existingMessage = await prisma.message.findUnique({
+        where: { id: messageId },
+        include: {
+          sender: {
+            select: {
+              id: true,
+              username: true,
+            },
+          },
+        },
+      });
+
+      if (!existingMessage) {
+        throw new TRPCError({
+          code: 'NOT_FOUND',
+          message: 'Message not found',
+        });
+      }
+
+      if (existingMessage.senderId !== userId) {
+        throw new TRPCError({
+          code: 'FORBIDDEN',
+          message: 'Not the sender of this message',
+        });
+      }
+
+      // Verify user is still a member of the conversation
+      const membership = await prisma.conversationMember.findFirst({
+        where: {
+          conversationId: existingMessage.conversationId,
+          userId,
+        },
+      });
+
+      if (!membership) {
+        throw new TRPCError({
+          code: 'FORBIDDEN',
+          message: 'Not a member of this conversation',
+        });
+      }
+
+      // Delete message and all related mentions in transaction
+      await prisma.$transaction(async (tx) => {
+        // Delete mentions first (due to foreign key constraint)
+        await tx.mention.deleteMany({
+          where: { messageId },
+        });
+
+        // Delete the message
+        await tx.message.delete({
+          where: { id: messageId },
+        });
+      });
+
+      // Broadcast message deletion to Pusher
+      try {
+        await pusher.trigger(`conversation-${existingMessage.conversationId}`, 'message-deleted', {
+          messageId,
+          conversationId: existingMessage.conversationId,
+          senderId: existingMessage.senderId,
+        });
+      } catch (error) {
+        console.error('Failed to broadcast message deletion:', error);
+        // Don't fail the request if Pusher fails
+      }
+
+      return {
+        success: true,
+        messageId,
+      };
+    }),
   markAsRead: protectedProcedure
     .input(
       z.object({
@@ -344,14 +569,20 @@ export const messageRouter = createTRPCRouter({
       });
 
       // Count unread mentions
+      // Use the later of lastViewedAt or lastViewedMentionAt
+      // This means if user viewed conversation after mention, mention is considered read
+      const mentionCutoffTime = membership.lastViewedMentionAt && membership.lastViewedAt 
+        ? (membership.lastViewedMentionAt > membership.lastViewedAt ? membership.lastViewedMentionAt : membership.lastViewedAt)
+        : (membership.lastViewedMentionAt || membership.lastViewedAt);
+      
       const unreadMentionCount = await prisma.mention.count({
         where: {
           userId,
           message: {
             conversationId,
             senderId: { not: userId },
-            ...(membership.lastViewedMentionAt && {
-              createdAt: { gt: membership.lastViewedMentionAt }
+            ...(mentionCutoffTime && {
+              createdAt: { gt: mentionCutoffTime }
             }),
           },
         },
