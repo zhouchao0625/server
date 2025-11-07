@@ -132,7 +132,113 @@ const updateUploadProgressSchema = z.object({
   progress: z.number().min(0).max(100),
 });
 
+// Helper function to get unified list of sections and assignments for a class
+async function getUnifiedList(tx: any, classId: string) {
+  const [sections, assignments] = await Promise.all([
+    tx.section.findMany({
+      where: { classId },
+      select: { id: true, order: true },
+    }),
+    tx.assignment.findMany({
+      where: { classId },
+      select: { id: true, order: true },
+    }),
+  ]);
+
+  // Combine and sort by order
+  const unified = [
+    ...sections.map((s: any) => ({ id: s.id, order: s.order, type: 'section' as const })),
+    ...assignments.map((a: any) => ({ id: a.id, order: a.order, type: 'assignment' as const })),
+  ].sort((a, b) => (a.order ?? Number.MAX_SAFE_INTEGER) - (b.order ?? Number.MAX_SAFE_INTEGER));
+
+  return unified;
+}
+
+// Helper function to normalize unified list to 1..n
+async function normalizeUnifiedList(tx: any, classId: string, orderedItems: Array<{ id: string; type: 'section' | 'assignment' }>) {
+  await Promise.all(
+    orderedItems.map((item, index) => {
+      if (item.type === 'section') {
+        return tx.section.update({ where: { id: item.id }, data: { order: index + 1 } });
+      } else {
+        return tx.assignment.update({ where: { id: item.id }, data: { order: index + 1 } });
+      }
+    })
+  );
+}
+
 export const assignmentRouter = createTRPCRouter({
+  // Reorder an assignment within the unified list (sections + assignments)
+  reorder: protectedTeacherProcedure
+    .input(z.object({
+      classId: z.string(),
+      movedId: z.string(),
+      // One of: place at start/end of unified list, or relative to targetId (can be section or assignment)
+      position: z.enum(['start', 'end', 'before', 'after']),
+      targetId: z.string().optional(), // Can be a section ID or assignment ID
+    }))
+    .mutation(async ({ ctx, input }) => {
+      const { classId, movedId, position, targetId } = input;
+
+      const moved = await prisma.assignment.findFirst({
+        where: { id: movedId, classId },
+        select: { id: true, classId: true },
+      });
+
+      if (!moved) {
+        throw new TRPCError({ code: 'NOT_FOUND', message: 'Assignment not found' });
+      }
+
+      if ((position === 'before' || position === 'after') && !targetId) {
+        throw new TRPCError({ code: 'BAD_REQUEST', message: 'targetId required for before/after' });
+      }
+
+      const result = await prisma.$transaction(async (tx) => {
+        const unified = await getUnifiedList(tx, classId);
+
+        // Find moved item and target in unified list
+        const movedIdx = unified.findIndex(item => item.id === movedId && item.type === 'assignment');
+        if (movedIdx === -1) {
+          throw new TRPCError({ code: 'NOT_FOUND', message: 'Assignment not found in unified list' });
+        }
+
+        // Build list without moved item
+        const withoutMoved = unified.filter(item => !(item.id === movedId && item.type === 'assignment'));
+
+        let next: Array<{ id: string; type: 'section' | 'assignment' }> = [];
+
+        if (position === 'start') {
+          next = [{ id: movedId, type: 'assignment' }, ...withoutMoved.map(item => ({ id: item.id, type: item.type }))];
+        } else if (position === 'end') {
+          next = [...withoutMoved.map(item => ({ id: item.id, type: item.type })), { id: movedId, type: 'assignment' }];
+        } else {
+          const targetIdx = withoutMoved.findIndex(item => item.id === targetId);
+          if (targetIdx === -1) {
+            throw new TRPCError({ code: 'BAD_REQUEST', message: 'targetId not found in unified list' });
+          }
+          if (position === 'before') {
+            next = [
+              ...withoutMoved.slice(0, targetIdx).map(item => ({ id: item.id, type: item.type })),
+              { id: movedId, type: 'assignment' },
+              ...withoutMoved.slice(targetIdx).map(item => ({ id: item.id, type: item.type })),
+            ];
+          } else {
+            next = [
+              ...withoutMoved.slice(0, targetIdx + 1).map(item => ({ id: item.id, type: item.type })),
+              { id: movedId, type: 'assignment' },
+              ...withoutMoved.slice(targetIdx + 1).map(item => ({ id: item.id, type: item.type })),
+            ];
+          }
+        }
+
+        // Normalize to 1..n
+        await normalizeUnifiedList(tx, classId, next);
+
+        return tx.assignment.findUnique({ where: { id: movedId } });
+      });
+
+      return result;
+    }),
   order: protectedTeacherProcedure
     .input(z.object({
       id: z.string(),
@@ -140,50 +246,62 @@ export const assignmentRouter = createTRPCRouter({
       order: z.number(),
     }))
     .mutation(async ({ ctx, input }) => {
+      // Deprecated: prefer `reorder`. For backward-compatibility, set the order then normalize unified list.
       const { id, order } = input;
 
-      const assignment = await prisma.assignment.update({
+      const current = await prisma.assignment.findUnique({
         where: { id },
-        data: { order },
+        select: { id: true, classId: true },
       });
 
-      return assignment;
+      if (!current) {
+        throw new TRPCError({ code: 'NOT_FOUND', message: 'Assignment not found' });
+      }
+
+      const updated = await prisma.$transaction(async (tx) => {
+        await tx.assignment.update({ where: { id }, data: { order } });
+
+        // Normalize entire unified list
+        const unified = await getUnifiedList(tx, current.classId);
+        await normalizeUnifiedList(tx, current.classId, unified.map(item => ({ id: item.id, type: item.type })));
+
+        return tx.assignment.findUnique({ where: { id } });
+      });
+
+      return updated;
     }),
 
     move: protectedTeacherProcedure
     .input(z.object({
       id: z.string(),
       classId: z.string(),
-      targetSectionId: z.string(),
+      targetSectionId: z.string().nullable().optional(),
     }))
     .mutation(async ({ ctx, input }) => {
-      const { id, targetSectionId } = input;
+      const { id } = input;
+      const targetSectionId = (input.targetSectionId ?? null) || null; // normalize empty string to null
 
-
-      const assignments = await prisma.assignment.findMany({
-        where: { sectionId: targetSectionId },
-      });
-
-      const stack = assignments.sort((a, b) => (a.order || 0) - (b.order || 0)).map((assignment, index) => ({
-        id: assignment.id,
-        order: index + 1,
-      })).map((assignment) => ({
-        where: { id: assignment.id },
-        data: { order: assignment.order },
-      }));
-
-      await Promise.all(
-        stack.map(({ where, data }) =>
-          prisma.assignment.update({ where, data })
-        )
-      );
-
-      const assignment = await prisma.assignment.update({
+      const moved = await prisma.assignment.findUnique({
         where: { id },
-        data: { sectionId: targetSectionId, order: 0 },
+        select: { id: true, classId: true, sectionId: true },
       });
 
-      return assignment;
+      if (!moved) {
+        throw new TRPCError({ code: 'NOT_FOUND', message: 'Assignment not found' });
+      }
+
+      const updated = await prisma.$transaction(async (tx) => {
+        // Update sectionId first
+        await tx.assignment.update({ where: { id }, data: { sectionId: targetSectionId } });
+
+        // The unified list ordering remains the same, just the assignment's sectionId changed
+        // No need to reorder since we're keeping the same position in the unified list
+        // If frontend wants to change position, they should call reorder after move
+
+        return tx.assignment.findUnique({ where: { id } });
+      });
+
+      return updated;
     }),
 
   create: protectedProcedure
@@ -234,26 +352,10 @@ export const assignmentRouter = createTRPCRouter({
       }
       console.log(markSchemeId, gradingBoundaryId);
 
-      // find all assignments in the section it is in (or none) and reorder them
-      const assignments = await prisma.assignment.findMany({
-        where: {
-          classId: classId,
-          ...(sectionId && {
-            sectionId: sectionId,
-          }),
-        },
-      });
-
-      const stack = assignments.sort((a, b) => (a.order || 0) - (b.order || 0)).map((assignment, index) => ({
-        id: assignment.id,
-        order: index + 1,
-      })).map((assignment) => ({
-        where: { id: assignment.id },
-        data: { order: assignment.order },
-      }));
-
-      // Create assignment with submissions for all students
-      const assignment = await prisma.assignment.create({
+      // Create assignment and place at top of its scope within a single transaction
+      const teacherId = ctx.user!.id;
+      const assignment = await prisma.$transaction(async (tx) => {
+        const created = await tx.assignment.create({
         data: {
           title,
           instructions,
@@ -262,7 +364,7 @@ export const assignmentRouter = createTRPCRouter({
           graded,
           weight,
           type,
-          order: 0,
+            order: 1,
           inProgress: inProgress || false,
           class: {
             connect: { id: classId }
@@ -289,11 +391,11 @@ export const assignmentRouter = createTRPCRouter({
               }
             }))
           },
-          teacher: {
-            connect: { id: ctx.user.id }
-          }
+            teacher: {
+              connect: { id: teacherId }
+            }
         },
-        select: {
+          select: {
           id: true,
           title: true,
           instructions: true,
@@ -327,14 +429,17 @@ export const assignmentRouter = createTRPCRouter({
               name: true
             }
           }
-        }
-      });
+          }
+        });
 
-      await Promise.all(
-        stack.map(({ where, data }) =>
-          prisma.assignment.update({ where, data })
-        )
-      );
+        // Insert new assignment at top of unified list and normalize
+        const unified = await getUnifiedList(tx, classId);
+        const withoutNew = unified.filter(item => !(item.id === created.id && item.type === 'assignment'));
+        const reindexed = [{ id: created.id, type: 'assignment' as const }, ...withoutNew.map(item => ({ id: item.id, type: item.type }))];
+        await normalizeUnifiedList(tx, classId, reindexed);
+
+        return created;
+      });
 
       // NOTE: Files are now handled via direct upload endpoints
       // The files field in the schema is for metadata only

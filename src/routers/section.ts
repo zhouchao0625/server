@@ -64,41 +64,135 @@ export const sectionRouter = createTRPCRouter({
         },
       });
 
-      // find all root items in the class and reorder them
-      const sections = await prisma.section.findMany({
-        where: {
-          classId: input.classId,
-        },
-      });
-
-      const assignments = await prisma.assignment.findMany({
-        where: {
-          classId: input.classId,
-          sectionId: null,
-        },
-      });
-
-      const stack = [...sections, ...assignments].sort((a, b) => (a.order || 0) - (b.order || 0)).map((item, index) => ({
-        id: item.id,
-        order: index + 1,
-      })).map((item) => ({
-        where: { id: item.id },
-        data: { order: item.order },
-      }));
-
-      // Update sections and assignments with their new order
-      await Promise.all([
-        ...stack.filter(item => sections.some(s => s.id === item.where.id))
-          .map(({ where, data }) => 
-            prisma.section.update({ where, data })
-          ),
-        ...stack.filter(item => assignments.some(a => a.id === item.where.id))
-          .map(({ where, data }) => 
-            prisma.assignment.update({ where, data })
-          )
+      // Insert new section at top of unified list (sections + assignments) and normalize
+      const [sections, assignments] = await Promise.all([
+        prisma.section.findMany({
+          where: { classId: input.classId },
+          select: { id: true, order: true },
+        }),
+        prisma.assignment.findMany({
+          where: { classId: input.classId },
+          select: { id: true, order: true },
+        }),
       ]);
 
+      const unified = [
+        ...sections.map(s => ({ id: s.id, order: s.order, type: 'section' as const })),
+        ...assignments.map(a => ({ id: a.id, order: a.order, type: 'assignment' as const })),
+      ].sort((a, b) => (a.order ?? Number.MAX_SAFE_INTEGER) - (b.order ?? Number.MAX_SAFE_INTEGER));
+
+      const withoutNew = unified.filter(item => !(item.id === section.id && item.type === 'section'));
+      const reindexed = [{ id: section.id, type: 'section' as const }, ...withoutNew.map(item => ({ id: item.id, type: item.type }))];
+
+      await Promise.all(
+        reindexed.map((item, index) => {
+          if (item.type === 'section') {
+            return prisma.section.update({ where: { id: item.id }, data: { order: index + 1 } });
+          } else {
+            return prisma.assignment.update({ where: { id: item.id }, data: { order: index + 1 } });
+          }
+        })
+      );
+
       return section;
+    }),
+
+  reorder: protectedProcedure
+    .input(z.object({
+      classId: z.string(),
+      movedId: z.string(), // Section ID
+      // One of: place at start/end of unified list, or relative to targetId (can be section or assignment)
+      position: z.enum(['start', 'end', 'before', 'after']),
+      targetId: z.string().optional(), // Can be a section ID or assignment ID
+    }))
+    .mutation(async ({ ctx, input }) => {
+      if (!ctx.user) {
+        throw new TRPCError({
+          code: "UNAUTHORIZED",
+          message: "User must be authenticated",
+        });
+      }
+
+      const { classId, movedId, position, targetId } = input;
+
+      const moved = await prisma.section.findFirst({
+        where: { id: movedId, classId },
+        select: { id: true, classId: true },
+      });
+
+      if (!moved) {
+        throw new TRPCError({ code: 'NOT_FOUND', message: 'Section not found' });
+      }
+
+      if ((position === 'before' || position === 'after') && !targetId) {
+        throw new TRPCError({ code: 'BAD_REQUEST', message: 'targetId required for before/after' });
+      }
+
+      const result = await prisma.$transaction(async (tx) => {
+        const [sections, assignments] = await Promise.all([
+          tx.section.findMany({
+            where: { classId },
+            select: { id: true, order: true },
+          }),
+          tx.assignment.findMany({
+            where: { classId },
+            select: { id: true, order: true },
+          }),
+        ]);
+
+        const unified = [
+          ...sections.map(s => ({ id: s.id, order: s.order, type: 'section' as const })),
+          ...assignments.map(a => ({ id: a.id, order: a.order, type: 'assignment' as const })),
+        ].sort((a, b) => (a.order ?? Number.MAX_SAFE_INTEGER) - (b.order ?? Number.MAX_SAFE_INTEGER));
+
+        const movedIdx = unified.findIndex(item => item.id === movedId && item.type === 'section');
+        if (movedIdx === -1) {
+          throw new TRPCError({ code: 'NOT_FOUND', message: 'Section not found in unified list' });
+        }
+
+        const withoutMoved = unified.filter(item => !(item.id === movedId && item.type === 'section'));
+
+        let next: Array<{ id: string; type: 'section' | 'assignment' }> = [];
+
+        if (position === 'start') {
+          next = [{ id: movedId, type: 'section' }, ...withoutMoved.map(item => ({ id: item.id, type: item.type }))];
+        } else if (position === 'end') {
+          next = [...withoutMoved.map(item => ({ id: item.id, type: item.type })), { id: movedId, type: 'section' }];
+        } else {
+          const targetIdx = withoutMoved.findIndex(item => item.id === targetId);
+          if (targetIdx === -1) {
+            throw new TRPCError({ code: 'BAD_REQUEST', message: 'targetId not found in unified list' });
+          }
+          if (position === 'before') {
+            next = [
+              ...withoutMoved.slice(0, targetIdx).map(item => ({ id: item.id, type: item.type })),
+              { id: movedId, type: 'section' },
+              ...withoutMoved.slice(targetIdx).map(item => ({ id: item.id, type: item.type })),
+            ];
+          } else {
+            next = [
+              ...withoutMoved.slice(0, targetIdx + 1).map(item => ({ id: item.id, type: item.type })),
+              { id: movedId, type: 'section' },
+              ...withoutMoved.slice(targetIdx + 1).map(item => ({ id: item.id, type: item.type })),
+            ];
+          }
+        }
+
+        // Normalize to 1..n
+        await Promise.all(
+          next.map((item, index) => {
+            if (item.type === 'section') {
+              return tx.section.update({ where: { id: item.id }, data: { order: index + 1 } });
+            } else {
+              return tx.assignment.update({ where: { id: item.id }, data: { order: index + 1 } });
+            }
+          })
+        );
+
+        return tx.section.findUnique({ where: { id: movedId } });
+      });
+
+      return result;
     }),
 
   update: protectedProcedure
@@ -176,11 +270,39 @@ export const sectionRouter = createTRPCRouter({
         });
       }
 
-      await prisma.section.update({
-        where: { id: input.id },
-        data: {
-          order: input.order,
-        },
+      // Update order and normalize unified list
+      await prisma.$transaction(async (tx) => {
+        await tx.section.update({
+          where: { id: input.id },
+          data: { order: input.order },
+        });
+
+        // Normalize entire unified list
+        const [sections, assignments] = await Promise.all([
+          tx.section.findMany({
+            where: { classId: input.classId },
+            select: { id: true, order: true },
+          }),
+          tx.assignment.findMany({
+            where: { classId: input.classId },
+            select: { id: true, order: true },
+          }),
+        ]);
+
+        const unified = [
+          ...sections.map(s => ({ id: s.id, order: s.order, type: 'section' as const })),
+          ...assignments.map(a => ({ id: a.id, order: a.order, type: 'assignment' as const })),
+        ].sort((a, b) => (a.order ?? Number.MAX_SAFE_INTEGER) - (b.order ?? Number.MAX_SAFE_INTEGER));
+
+        await Promise.all(
+          unified.map((item, index) => {
+            if (item.type === 'section') {
+              return tx.section.update({ where: { id: item.id }, data: { order: index + 1 } });
+            } else {
+              return tx.assignment.update({ where: { id: item.id }, data: { order: index + 1 } });
+            }
+          })
+        );
       });
 
       return { id: input.id };
