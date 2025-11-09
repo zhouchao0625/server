@@ -102,7 +102,8 @@ export async function createDirectUploadFile(
   userId: string,
   directory?: string,
   assignmentId?: string,
-  submissionId?: string
+  submissionId?: string,
+  announcementId?: string
 ): Promise<DirectUploadFile> {
   try {
     // Validate file extension matches MIME type
@@ -166,6 +167,11 @@ export async function createDirectUploadFile(
         ...(submissionId && {
           submission: {
             connect: { id: submissionId }
+          }
+        }),
+        ...(announcementId && {
+          announcement: {
+            connect: { id: announcementId }
           }
         })
       },
@@ -323,11 +329,12 @@ export async function createDirectUploadFiles(
   userId: string,
   directory?: string,
   assignmentId?: string,
-  submissionId?: string
+  submissionId?: string,
+  announcementId?: string
 ): Promise<DirectUploadFile[]> {
   try {
     const uploadPromises = files.map(file => 
-      createDirectUploadFile(file, userId, directory, assignmentId, submissionId)
+      createDirectUploadFile(file, userId, directory, assignmentId, submissionId, announcementId)
     );
     return await Promise.all(uploadPromises);
   } catch (error) {
