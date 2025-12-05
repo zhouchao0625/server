@@ -725,7 +725,7 @@ export const classRouter = createTRPCRouter({
 
         return events;
       }),
-    listMarkSchemes: protectedTeacherProcedure
+    listMarkSchemes: protectedClassMemberProcedure
       .input(z.object({
         classId: z.string(),
       }))
@@ -804,7 +804,7 @@ export const classRouter = createTRPCRouter({
 
         return markScheme;
       }),
-    listGradingBoundaries: protectedTeacherProcedure
+    listGradingBoundaries: protectedClassMemberProcedure
       .input(z.object({
         classId: z.string(),
       }))
